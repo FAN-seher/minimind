@@ -1,85 +1,161 @@
 import torch
 from torch import nn
-
-
-class LoRAAdapter(nn.Module):
-    def __init__(self, in_features, out_features, rank):
-        super().__init__()
-        self.A = nn.Linear(in_features, rank, bias=False)
-        self.B = nn.Linear(rank, out_features, bias=False)
-        self.A.weight.data.normal_(mean=0.0, std=0.02)
-        self.B.weight.data.zero_()
-
-    def forward(self, x):
-        return self.B(self.A(x))
+import torch.nn.functional as F
 
 
 class DoRA(nn.Module):
-    def __init__(self, in_features, out_features, rank, alpha=1.0, init_m=None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        r: int = 8,
+        lora_alpha: float = 8.0,
+        lora_dropout: float = 0.0,
+        bias: bool = True,
+        eps: float = 1e-6,
+    ):
         super().__init__()
-        self.alpha = alpha
-        self.m = nn.Parameter(init_m if init_m is not None else torch.ones(in_features))
-        self.adapter = LoRAAdapter(in_features, out_features, rank)
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.r = r
+        self.lora_alpha = lora_alpha
+        self.scaling = lora_alpha / r if r > 0 else 1.0
+        self.eps = eps
+
+        # 预训练权重
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.bias = None
+
+        if r > 0:
+            self.lora_A = nn.Parameter(torch.zeros(r, in_features))
+            self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+            self.lora_dropout = nn.Identity()
+
+        self.magnitude = nn.Parameter(torch.ones(1, in_features))
+
+        self.reset_parameters()
+
+        # 冻结 base weight
+        self.weight.requires_grad = False
+
+    def reset_parameters(self):
+
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+        if self.r > 0:
+            nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+            nn.init.zeros_(self.lora_B)
+
+        with torch.no_grad():
+
+            col_norm = torch.norm(self.weight, dim=0, keepdim=True)
+            col_norm = torch.clamp(col_norm, min=self.eps)
+
+            self.magnitude.copy_(col_norm)
+
+    def _effective_weight(self):
+
+        W0 = self.weight
+
+        if self.r > 0:
+
+            delta_V = self.scaling * (self.lora_B @ self.lora_A)
+
+            V = W0 + delta_V
+
+        else:
+
+            V = W0
+
+        col_norm = torch.norm(V, dim=0, keepdim=True)
+        col_norm = torch.clamp(col_norm, min=self.eps)
+
+        direction = V / col_norm
+
+        W_eff = direction * self.magnitude
+
+        return W_eff
 
     def forward(self, x):
-        x_scaled = x * self.m
-        return self.alpha * self.adapter(x_scaled)
 
+        W_eff = self._effective_weight()
 
-def apply_dora(model, rank=16, alpha=1.0):
-    eps = 1e-6
+        return F.linear(x, W_eff, self.bias)
+
+def apply_dora(model, rank=16):
+
     for name, module in model.named_modules():
+
         if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
-            original_weight = module.weight.data.clone()
-            column_norm = original_weight.norm(dim=0, keepdim=True)
-            direction = original_weight / (column_norm + eps)
-            module.weight.data = direction
-            module.weight.requires_grad = False
 
-            dora = DoRA(module.weight.shape[1], module.weight.shape[0], rank=rank, alpha=alpha, init_m=column_norm.squeeze(0)).to(module.weight.device)
-            setattr(module, 'dora', dora)
-            original_forward = module.forward
+            dora = DoRA(
+                module.in_features,
+                module.out_features,
+                r=rank,
+                bias=(module.bias is not None)
+            ).to(module.weight.device)
 
-            def forward_with_dora(x, layer1=original_forward, layer2=dora):
-                x_scaled = x * layer2.m
-                return layer1(x_scaled) + layer2(x_scaled)
+            # 复制原始权重
+            dora.weight.data.copy_(module.weight.data)
+
+            if module.bias is not None:
+                dora.bias.data.copy_(module.bias.data)
+
+            setattr(module, "dora", dora)
+
+            # forward替换
+            def forward_with_dora(x, layer2=dora):
+                return layer2(x)
 
             module.forward = forward_with_dora
 
-
 def load_dora(model, path):
+
     state_dict = torch.load(path, map_location=model.device)
+
     state_dict = {(k[7:] if k.startswith('module.') else k): v for k, v in state_dict.items()}
 
     for name, module in model.named_modules():
+
         if hasattr(module, 'dora'):
-            dora_state = {k.replace(f'{name}.dora.', ''): v for k, v in state_dict.items() if f'{name}.dora.' in k}
+
+            dora_state = {
+                k.replace(f'{name}.dora.', ''): v
+                for k, v in state_dict.items()
+                if f'{name}.dora.' in k
+            }
+
             module.dora.load_state_dict(dora_state)
 
-
 def save_dora(model, path):
+
     raw_model = getattr(model, '_orig_mod', model)
+
     state_dict = {}
+
     for name, module in raw_model.named_modules():
+
         if hasattr(module, 'dora'):
-            clean_name = name[7:] if name.startswith('module.') else name
-            dora_state = {f'{clean_name}.dora.{k}': v.cpu().half() for k, v in module.dora.state_dict().items()}
+
+            clean_name = name[7:] if name.startswith("module.") else name
+
+            dora_state = {
+                f'{clean_name}.dora.{k}': v.cpu().half()
+                for k, v in module.dora.state_dict().items()
+            }
+
             state_dict.update(dora_state)
+
     torch.save(state_dict, path)
-
-
-def merge_dora(model, dora_path, save_path):
-    load_dora(model, dora_path)
-    raw_model = getattr(model, '_orig_mod', model)
-    state_dict = {k: v.cpu().half() for k, v in raw_model.state_dict().items() if '.dora.' not in k}
-    for name, module in raw_model.named_modules():
-        if isinstance(module, nn.Linear) and '.dora.' not in name:
-            base_direction = module.weight.data.clone()
-            if hasattr(module, 'dora'):
-                adapter = module.dora.adapter
-                combined = base_direction + (adapter.B.weight.data @ adapter.A.weight.data)
-                full_weight = combined * module.dora.m.unsqueeze(0)
-                state_dict[f'{name}.weight'] = full_weight.cpu().half()
-            else:
-                state_dict[f'{name}.weight'] = base_direction.cpu().half()
-    torch.save(state_dict, save_path)

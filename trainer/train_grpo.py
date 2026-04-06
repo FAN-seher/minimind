@@ -134,7 +134,18 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         if args.loss_type == "cispo":
             clamped_ratio = torch.clamp(ratio, max=args.epsilon_high).detach()
             per_token_loss = -(clamped_ratio * advantages.unsqueeze(1) * per_token_logps - args.beta * per_token_kl)
-        else:
+        elif args.loss_type == "gspo":
+            # GSPO: Generalized Sequential Policy Optimization
+            # Sequence-level clipped objective, then broadcast to token loss.
+            valid_len = completion_mask.sum(dim=1).clamp_min(1).float()  # [B*num_gen]
+            log_ratio = (per_token_logps - old_per_token_logps) * completion_mask
+            seq_ratio = torch.exp(log_ratio.sum(dim=1))  # [B*num_gen]
+            clipped_seq_ratio = torch.clamp(seq_ratio, 1 - args.epsilon, 1 + args.epsilon)
+            seq_loss1 = seq_ratio * advantages
+            seq_loss2 = clipped_seq_ratio * advantages
+            seq_objective = torch.min(seq_loss1, seq_loss2)  # [B*num_gen]
+            per_token_loss = -(seq_objective.unsqueeze(1) / valid_len.unsqueeze(1) - args.beta * per_token_kl)
+        else:  # grpo
             clipped_ratio = torch.clamp(ratio, 1 - args.epsilon, 1 + args.epsilon)
             per_token_loss1 = ratio * advantages.unsqueeze(1)
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
@@ -224,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="../dataset/rlaif.jsonl", help="RLAIF数据路径")
     parser.add_argument("--num_generations", type=int, default=6, help="每个prompt生成的样本数")
     parser.add_argument("--beta", type=float, default=0.1, help="KL惩罚系数")
-    parser.add_argument("--loss_type", type=str, default="cispo", choices=["grpo", "cispo"], help="loss类型")
+    parser.add_argument("--loss_type", type=str, default="grpo", choices=["grpo", "cispo", "gspo"], help="loss类型")
     parser.add_argument("--epsilon", type=float, default=0.2, help="GRPO的PPO clip epsilon")
     parser.add_argument("--epsilon_high", type=float, default=5.0, help="epsilon上界")
     parser.add_argument('--from_weight', default='full_sft', type=str, help="基于哪个权重训练")
