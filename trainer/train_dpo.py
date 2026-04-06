@@ -46,7 +46,15 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
     logits = pi_logratios - ref_logratios
     loss = -F.logsigmoid(beta * logits)
-    return loss.mean()
+
+    # 监控指标：policy 侧 chosen/rejected 的序列对数概率与差值；accuracy 表示 margin>0 的比例
+    metrics = {
+        "chosen_policy_logp": chosen_policy_log_probs.mean().detach(),
+        "rejected_policy_logp": reject_policy_log_probs.mean().detach(),
+        "policy_logp_margin": (chosen_policy_log_probs - reject_policy_log_probs).mean().detach(),
+        "preference_accuracy": (logits > 0).float().mean().detach(),
+    }
+    return loss.mean(), metrics
 
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
@@ -79,7 +87,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             logits = outputs.logits
             policy_log_probs = logits_to_log_probs(logits, y)
             
-            dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+            dpo_loss_val, dpo_metrics = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
             loss = dpo_loss_val + outputs.aux_loss
             loss = loss / args.accumulation_steps
 
@@ -97,12 +105,35 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             current_loss = loss.item() * args.accumulation_steps
             current_dpo_loss = dpo_loss_val.item()
             current_aux_loss = outputs.aux_loss.item()
+            current_chosen_logp = dpo_metrics["chosen_policy_logp"].item()
+            current_rejected_logp = dpo_metrics["rejected_policy_logp"].item()
+            current_logp_margin = dpo_metrics["policy_logp_margin"].item()
+            current_pref_acc = dpo_metrics["preference_accuracy"].item()
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, dpo_loss: {current_dpo_loss:.4f}, aux_loss: {current_aux_loss:.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
+            Logger(
+                f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), "
+                f"loss: {current_loss:.4f}, dpo_loss: {current_dpo_loss:.4f}, aux_loss: {current_aux_loss:.4f}, "
+                f"chosen_logp: {current_chosen_logp:.4f}, rejected_logp: {current_rejected_logp:.4f}, "
+                f"logp_margin: {current_logp_margin:.4f}, pref_acc: {current_pref_acc:.4f}, "
+                f"learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min"
+            )
             
-            if wandb: wandb.log({"loss": current_loss, "dpo_loss": current_dpo_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            if wandb:
+                wandb.log(
+                    {
+                        "loss": current_loss,
+                        "dpo_loss": current_dpo_loss,
+                        "aux_loss": current_aux_loss,
+                        "chosen_logp": current_chosen_logp,
+                        "rejected_logp": current_rejected_logp,
+                        "logp_margin": current_logp_margin,
+                        "pref_accuracy": current_pref_acc,
+                        "learning_rate": current_lr,
+                        "epoch_time": eta_min,
+                    }
+                )
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
